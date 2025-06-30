@@ -9,28 +9,30 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      # 步骤 1: 验证所有必要的 Secrets 是否存在
+      # 步骤 1: 验证所有必要的 Secrets 是否存在（修复版）
       - name: Verify Secrets
         run: |
-          required_secrets=("SYNC_TOKEN" "TELEGRAM_BOT_TOKEN" "TELEGRAM_CHAT_ID")
-          missing_secrets=()
-          
-          for secret in "${required_secrets[@]}"; do
-            if [ -z "${{ secrets[secret] }}" ]; then
-              missing_secrets+=("$secret")
-            fi
-          done
-          
-          if [ ${#missing_secrets[@]} -gt 0 ]; then
-            echo "::error::以下必需的Secrets未设置: ${missing_secrets[*]}"
+          # 分别检查每个secret
+          if [ -z "${{ secrets.SYNC_TOKEN }}" ]; then
+            echo "::error::SYNC_TOKEN未设置"
             exit 1
-          else
-            echo "所有必需的Secrets已设置"
-            # 安全地显示部分Token用于调试
-            BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
-            echo "BOT_TOKEN_PART=${BOT_TOKEN:0:2}****${BOT_TOKEN: -2}" >> $GITHUB_ENV
-            echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
           fi
+          
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN未设置"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID未设置"
+            exit 1
+          fi
+          
+          echo "所有必需的Secrets已设置"
+          # 安全地显示部分Token用于调试
+          BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          echo "BOT_TOKEN_PART=${BOT_TOKEN:0:2}****${BOT_TOKEN: -2}" >> $GITHUB_ENV
+          echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
 
       # 步骤 2: 获取目标仓库的默认分支
       - name: Detect default branch
@@ -257,4 +259,4 @@ jobs:
             ━━━━━━━━━━━━━━━━━━━━━━━━
             {{ if success() }}
             ✅ 同步已完成
-            [查看提交](${{ github.server_url }}/${{ github.repository }}/
+            [查看提交](${{ github.server_url }}/${{ github.repository }}/commit/${{ gi
