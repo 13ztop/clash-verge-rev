@@ -9,9 +9,207 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      # [所有同步步骤保持不变...]
-      
-      # 设置时区（上海时间）
+      # 步骤 1: 验证所有必要的 Secrets 是否存在
+      - name: Verify Secrets
+        run: |
+          required_secrets=("SYNC_TOKEN" "TELEGRAM_BOT_TOKEN" "TELEGRAM_CHAT_ID")
+          missing_secrets=()
+          
+          for secret in "${required_secrets[@]}"; do
+            if [ -z "${{ secrets[secret] }}" ]; then
+              missing_secrets+=("$secret")
+            fi
+          done
+          
+          if [ ${#missing_secrets[@]} -gt 0 ]; then
+            echo "::error::以下必需的Secrets未设置: ${missing_secrets[*]}"
+            exit 1
+          else
+            echo "所有必需的Secrets已设置"
+            # 安全地显示部分Token用于调试
+            BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+            echo "BOT_TOKEN_PART=${BOT_TOKEN:0:2}****${BOT_TOKEN: -2}" >> $GITHUB_ENV
+            echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
+          fi
+
+      # 步骤 2: 获取目标仓库的默认分支
+      - name: Detect default branch
+        id: branch_detector
+        run: |
+          echo "使用SYNC_TOKEN: ${SYNC_TOKEN:0:2}****${SYNC_TOKEN: -2}"
+          DEFAULT_BRANCH=$(curl -s -H "Authorization: token ${{ secrets.SYNC_TOKEN }}" \
+          "https://api.github.com/repos/13ztop/clash-verge-rev" | jq -r .default_branch)
+          
+          if [ -z "$DEFAULT_BRANCH" ] || [ "$DEFAULT_BRANCH" = "null" ]; then
+            echo "::warning::无法获取默认分支，使用备用分支'main'"
+            DEFAULT_BRANCH="main"
+          fi
+          
+          echo "Detected default branch: $DEFAULT_BRANCH"
+          echo "DEFAULT_BRANCH=$DEFAULT_BRANCH" >> $GITHUB_ENV
+
+      # 步骤 3: 检出目标仓库（您的仓库）
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SYNC_TOKEN }}
+          repository: 13ztop/clash-verge-rev
+          path: target-repo
+          ref: ${{ env.DEFAULT_BRANCH }}
+          fetch-depth: 0
+
+      # 步骤 4: 克隆源仓库（公共仓库）
+      - name: Clone source repo
+        run: |
+          git clone --depth 1 --branch main https://github.com/clash-verge-rev/clash-verge-rev.git source-repo
+          echo "源仓库 clash-verge-rev/clash-verge-rev 克隆完成"
+
+      # 步骤 5: 创建备份目录
+      - name: Create backup directory
+        run: mkdir -p /tmp/repo-backup
+
+      # 步骤 6: 识别需要保留的文件
+      - name: Identify protected files
+        id: find_protected
+        run: |
+          # 需要保留的核心文件列表
+          protected_files=(
+            "README*.md"
+            "LICENSE*"
+            ".github/workflows/*"  # 整个工作流目录
+            "config/"             # 配置目录
+            "custom/"             # 自定义配置目录
+            "assets/custom/*"     # 自定义资源文件
+            ".env*"               # 环境文件
+          )
+          
+          # 创建保留文件列表
+          mkdir -p /tmp/repo-backup
+          for pattern in "${protected_files[@]}"; do
+            find target-repo -path "*/$pattern" -print >> /tmp/repo-backup/protected-files.txt 2>/dev/null || true
+          done
+          
+          # 添加额外保留文件
+          echo "target-repo/.gitignore" >> /tmp/repo-backup/protected-files.txt
+          echo "target-repo/package.json" >> /tmp/repo-backup/protected-files.txt
+          
+          # 保存文件数量
+          if [ -f /tmp/repo-backup/protected-files.txt ]; then
+            protected_count=$(sort -u /tmp/repo-backup/protected-files.txt | wc -l)
+            echo "protected_files_count=$protected_count" >> $GITHUB_OUTPUT
+          else
+            echo "protected_files_count=0" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "保护文件识别完成"
+
+      # 步骤 7: 备份需要保留的文件
+      - name: Backup protected content
+        run: |
+          mkdir -p /tmp/repo-backup/protected-files
+          
+          if [ -f /tmp/repo-backup/protected-files.txt ]; then
+            while read file; do
+              if [ -f "$file" ] || [ -d "$file" ]; then
+                relative_path=${file#target-repo/}
+                mkdir -p "/tmp/repo-backup/protected-files/$(dirname "$relative_path")"
+                cp -r "$file" "/tmp/repo-backup/protected-files/$relative_path"
+              fi
+            done < <(sort -u /tmp/repo-backup/protected-files.txt)
+          fi
+          
+          echo "保护文件备份完成"
+
+      # 步骤 8: 获取源仓库版本信息
+      - name: Get source repository version
+        id: source_version
+        run: |
+          cd source-repo
+          echo "commit_hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "full_hash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "commit_date=$(git log -1 --format=%cd --date=format:'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "tag=$(git describe --tags --abbrev=0 || echo '无标签')" >> $GITHUB_OUTPUT
+
+      # 步骤 9: 获取目标仓库版本信息
+      - name: Get target repository commit
+        id: target_version
+        run: |
+          cd target-repo
+          echo "TARGET_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "TARGET_BRANCH=${{ env.DEFAULT_BRANCH }}" >> $GITHUB_ENV
+
+      # 步骤 10: 执行同步操作
+      - name: Sync repositories
+        run: |
+          # 使用rsync同步，排除.git目录和备份文件
+          rsync -av --delete \
+            --exclude=.git \
+            --exclude-from=/tmp/repo-backup/protected-files.txt \
+            source-repo/ target-repo/
+          
+          echo "源仓库内容同步完成"
+
+      # 步骤 11: 恢复保护文件
+      - name: Restore protected content
+        run: |
+          if [ -d /tmp/repo-backup/protected-files ]; then
+            cd /tmp/repo-backup/protected-files
+            find . -type f -o -type d | while read item; do
+              if [ -d "$item" ]; then
+                mkdir -p "$GITHUB_WORKSPACE/target-repo/$item"
+              else
+                mkdir -p "$GITHUB_WORKSPACE/target-repo/$(dirname "$item")"
+                cp "$item" "$GITHUB_WORKSPACE/target-repo/$item"
+              fi
+            done
+          fi
+          
+          echo "保护文件恢复完成"
+
+      # 步骤 12: 提交和推送变更
+      - name: Commit and push changes
+        id: commit_push
+        run: |
+          cd target-repo
+          git config user.name "GitHub Actions Sync"
+          git config user.email "actions@github.com"
+          git add -A
+          
+          # 检查是否有变更
+          if git diff-index --quiet HEAD --; then
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+            echo "no_changes_detected=true" >> $GITHUB_OUTPUT
+            echo "没有需要提交的变更"
+          else
+            # 计算变更文件数量
+            changes_count=$(git diff --name-only HEAD | wc -l)
+            echo "changes_count=$changes_count" >> $GITHUB_OUTPUT
+            
+            # 生成提交信息
+            commit_msg="自动同步: 来自 clash-verge-rev/clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}"
+            commit_msg+="\n\n更新 $changes_count 个文件"
+            if [ ${{ steps.find_protected.outputs.protected_files_count }} -gt 0 ]; then
+              commit_msg+=", 保留 ${{ steps.find_protected.outputs.protected_files_count }} 个保护文件"
+            fi
+            
+            # 添加标签信息（如果有）
+            if [ "${{ steps.source_version.outputs.tag }}" != "无标签" ]; then
+              commit_msg+="\n\n最新版本: ${{ steps.source_version.outputs.tag }}"
+            fi
+            
+            git commit -m "$commit_msg"
+            git push origin HEAD:${{ env.DEFAULT_BRANCH }}
+            echo "commit_msg=$commit_msg" >> $GITHUB_OUTPUT
+            echo "变更已成功推送"
+          fi
+
+      # 步骤 13: 清理临时文件
+      - name: Cleanup
+        run: |
+          rm -rf source-repo
+          rm -rf /tmp/repo-backup
+
+      # 步骤 14: 设置时区（上海时间）
       - name: Set Shanghai time
         id: set_time
         run: |
@@ -20,127 +218,43 @@ jobs:
           echo "CURRENT_TIME=$CURRENT_TIME" >> $GITHUB_ENV
           echo "CURRENT_TIME_SHORT=$CURRENT_TIME_SHORT" >> $GITHUB_ENV
 
-      # 调试步骤：验证Telegram设置
-      - name: Verify Telegram Configuration
+      # 步骤 15: 调试步骤 - 显示关键信息
+      - name: Debug Information
         run: |
-          echo "验证Telegram设置..."
-          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
-            echo "::error::TELEGRAM_BOT_TOKEN未设置"
-            exit 1
-          fi
-          
-          if [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
-            echo "::error::TELEGRAM_CHAT_ID未设置"
-            exit 1
-          fi
-          
-          echo "Telegram配置验证通过"
-          echo "BOT_TOKEN_PART=${secrets.TELEGRAM_BOT_TOKEN:0:4}...${secrets.TELEGRAM_BOT_TOKEN: -4}" >> $GITHUB_ENV
-          echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
+          echo "===== 调试信息 ====="
+          echo "当前时间: ${{ env.CURRENT_TIME }}"
+          echo "BOT_TOKEN_PART: ${{ env.BOT_TOKEN_PART }}"
+          echo "CHAT_ID: ${{ env.CHAT_ID }}"
+          echo "工作流状态: ${{ job.status }}"
+          echo "源仓库版本: ${{ steps.source_version.outputs.commit_hash }}"
+          echo "目标仓库版本: ${{ env.TARGET_COMMIT }}"
+          echo "变更文件数: ${{ steps.commit_push.outputs.changes_count }}"
+          echo "保留文件数: ${{ steps.find_protected.outputs.protected_files_count }}"
+          echo "===================="
 
-      # 调试步骤：检查通知条件
-      - name: Check Notification Conditions
-        id: check_conditions
-        run: |
-          echo "检查通知条件..."
-          
-          # 检查是否有变更
-          if [ -n "${{ steps.commit_push.outputs.commit_msg }}" ]; then
-            echo "有变更需要通知"
-            echo "should_notify=true" >> $GITHUB_ENV
-            echo "notification_type=success" >> $GITHUB_ENV
-          elif [ "${{ steps.commit_push.outputs.no_changes_detected }}" = "true" ]; then
-            echo "无变更需要通知"
-            echo "should_notify=true" >> $GITHUB_ENV
-            echo "notification_type=no_changes" >> $GITHUB_ENV
-          else
-            echo "无通知条件满足"
-            echo "should_notify=false" >> $GITHUB_ENV
-          fi
-          
-          # 检查失败情况
-          if [ "${{ job.status }}" != "success" ]; then
-            echo "工作流失败需要通知"
-            echo "should_notify=true" >> $GITHUB_ENV
-            echo "notification_type=failure" >> $GITHUB_ENV
-          fi
-          
-          echo "条件检查完成"
-
-      # 测试通知（总是发送）
-      - name: Test Telegram Notification (Always Send)
-        if: ${{ always() }}  # 即使失败也发送
+      # 步骤 16: 最终通知（总是发送）
+      - name: Final Telegram Notification
+        if: always()  # 即使失败也发送
         uses: appleboy/telegram-action@v1.0.0
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           parse_mode: markdown
           message: |
-            🔧 *Clash Verge Rev 工作流测试通知*
+            {{ if success() }}✅{{ else }}‼️{{ endif }} *Clash Verge Rev 同步报告 | ${{ env.CURRENT_TIME_SHORT }}*
             ━━━━━━━━━━━━━━━━━━━━━━━━
+            • **状态**: {{ if success() }}成功{{ else }}失败{{ endif }}
             • **工作流**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            • **运行时间**: ${{ env.CURRENT_TIME }}
-            • **状态**: ${{ job.status }}
+            • **源仓库**: [clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}](https://github.com/clash-verge-rev/clash-verge-rev/commit/${{ steps.source_version.outputs.full_hash }})
+            • **目标仓库**: [13ztop@${{ env.TARGET_COMMIT }}](https://github.com/13ztop/clash-verge-rev/commit/${{ github.sha }})
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            ℹ️ 这是一条测试消息，验证通知功能是否正常
-            • BOT_TOKEN: ${{ env.BOT_TOKEN_PART }}
-            • CHAT_ID: ${{ env.CHAT_ID }}
-
-      # 同步成功通知
-      - name: Notify Telegram on Sync Success
-        if: ${{ success() && env.should_notify == 'true' && env.notification_type == 'success' }}
-        uses: appleboy/telegram-action@v1.0.0
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          parse_mode: markdown
-          message: |
-            🔄 *Clash Verge Rev 同步成功 | ${{ steps.source_version.outputs.commit_date }}*
-            ━━━━━━━━━━━━━━━━━━━━━━━━
-            📦 **源仓库**: [clash-verge-rev/clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}](https://github.com/clash-verge-rev/clash-verge-rev/commit/${{ steps.source_version.outputs.full_hash }})
-            🏠 **目标仓库**: [13ztop/clash-verge-rev@${{ env.TARGET_COMMIT }}](https://github.com/13ztop/clash-verge-rev/commit/${{ github.sha }})
-            ━━━━━━━━━━━━━━━━━━━━━━━━
-            • **变更文件**: ${{ steps.commit_push.outputs.changes_count }} 个
-            • **保留文件**: ${{ steps.find_protected.outputs.protected_files_count }} 个
+            {{ if steps.commit_push.outputs.changes_count > 0 }}
+            • **变更文件**: ${{ steps.commit_push.outputs.changes_count }}
+            {{ endif }}
+            • **保留文件**: ${{ steps.find_protected.outputs.protected_files_count }}
             • **版本**: ${{ steps.source_version.outputs.tag }}
-            • **同步时间**: ${{ env.CURRENT_TIME }}
+            • **运行时间**: ${{ env.CURRENT_TIME }}
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            ✅ 仓库已更新
-            [查看提交详情](https://github.com/13ztop/clash-verge-rev/commit/${{ github.sha }})
-
-      # 无变更通知
-      - name: Notify Telegram on No Changes
-        if: ${{ success() && env.should_notify == 'true' && env.notification_type == 'no_changes' }}
-        uses: appleboy/telegram-action@v1.0.0
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          parse_mode: markdown
-          message: |
-            ℹ️ *Clash Verge Rev 无变更 | ${{ steps.source_version.outputs.commit_date }}*
-            ━━━━━━━━━━━━━━━━━━━━━━━━
-            📦 **源仓库**: [clash-verge-rev/clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}](https://github.com/clash-verge-rev/clash-verge-rev)
-            🏠 **目标仓库**: [13ztop/clash-verge-rev@${{ env.TARGET_COMMIT }}](https://github.com/13ztop/clash-verge-rev)
-            ━━━━━━━━━━━━━━━━━━━━━━━━
-            • **保留文件**: ${{ steps.find_protected.outputs.protected_files_count }} 个
-            • **当前版本**: ${{ steps.source_version.outputs.tag }}
-            • **检测时间**: ${{ env.CURRENT_TIME }}
-            ━━━━━━━━━━━━━━━━━━━━━━━━
-            ✅ 仓库已是最新状态
-
-      # 同步失败通知
-      - name: Notify Telegram on Failure
-        if: ${{ failure() && env.should_notify == 'true' && env.notification_type == 'failure' }}
-        uses: appleboy/telegram-action@v1.0.0
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          parse_mode: markdown
-          message: |
-            ‼️ *Clash Verge Rev 同步失败*
-            ━━━━━━━━━━━━━━━━━━━━━━━━
-            🔧 **工作流**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            ⏰ **发生时间**: ${{ env.CURRENT_TIME }}
-            ━━━━━━━━━━━━━━━━━━━━━━━━
-            🚨 同步过程遇到错误，请检查日志！
-            [查看错误详情](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            {{ if success() }}
+            ✅ 同步已完成
+            [查看提交](${{ github.server_url }}/${{ github.repository }}/
