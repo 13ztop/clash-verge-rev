@@ -12,7 +12,6 @@ jobs:
       # 步骤 1: 验证所有必要的 Secrets 是否存在
       - name: Verify Secrets
         run: |
-          # 分别检查每个secret
           if [ -z "${{ secrets.SYNC_TOKEN }}" ]; then
             echo "::error::SYNC_TOKEN未设置"
             exit 1
@@ -29,7 +28,6 @@ jobs:
           fi
           
           echo "所有必需的Secrets已设置"
-          # 安全地显示部分Token用于调试
           BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
           echo "BOT_TOKEN_PART=${BOT_TOKEN:0:2}****${BOT_TOKEN: -2}" >> $GITHUB_ENV
           echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
@@ -38,7 +36,6 @@ jobs:
       - name: Detect default branch
         id: branch_detector
         run: |
-          echo "使用SYNC_TOKEN: ${SYNC_TOKEN:0:2}****${SYNC_TOKEN: -2}"
           DEFAULT_BRANCH=$(curl -s -H "Authorization: token ${{ secrets.SYNC_TOKEN }}" \
           "https://api.github.com/repos/13ztop/clash-verge-rev" | jq -r .default_branch)
           
@@ -50,9 +47,159 @@ jobs:
           echo "Detected default branch: $DEFAULT_BRANCH"
           echo "DEFAULT_BRANCH=$DEFAULT_BRANCH" >> $GITHUB_ENV
 
-      # 步骤 3-14: [保持不变]...
+      # 步骤 3: 检出目标仓库
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SYNC_TOKEN }}
+          repository: 13ztop/clash-verge-rev
+          path: target-repo
+          ref: ${{ env.DEFAULT_BRANCH }}
+          fetch-depth: 0
 
-      # 步骤 15: 设置时区（上海时间）
+      # 步骤 4: 克隆源仓库
+      - name: Clone source repo
+        run: |
+          git clone --depth 1 --branch main https://github.com/clash-verge-rev/clash-verge-rev.git source-repo
+          echo "源仓库 clash-verge-rev/clash-verge-rev 克隆完成"
+
+      # 步骤 5: 创建备份目录
+      - name: Create backup directory
+        run: mkdir -p /tmp/repo-backup
+
+      # 步骤 6: 识别需要保留的文件
+      - name: Identify protected files
+        id: find_protected
+        run: |
+          protected_files=(
+            "README*.md"
+            "LICENSE*"
+            ".github/workflows/*"
+            "config/"
+            "custom/"
+            "assets/custom/*"
+            ".env*"
+          )
+          
+          mkdir -p /tmp/repo-backup
+          for pattern in "${protected_files[@]}"; do
+            find target-repo -path "*/$pattern" -print >> /tmp/repo-backup/protected-files.txt 2>/dev/null || true
+          done
+          
+          echo "target-repo/.gitignore" >> /tmp/repo-backup/protected-files.txt
+          echo "target-repo/package.json" >> /tmp/repo-backup/protected-files.txt
+          
+          if [ -f /tmp/repo-backup/protected-files.txt ]; then
+            protected_count=$(sort -u /tmp/repo-backup/protected-files.txt | wc -l)
+            echo "protected_files_count=$protected_count" >> $GITHUB_OUTPUT
+          else
+            echo "protected_files_count=0" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "保护文件识别完成"
+
+      # 步骤 7: 备份需要保留的文件
+      - name: Backup protected content
+        run: |
+          mkdir -p /tmp/repo-backup/protected-files
+          
+          if [ -f /tmp/repo-backup/protected-files.txt ]; then
+            while read file; do
+              if [ -f "$file" ] || [ -d "$file" ]; then
+                relative_path=${file#target-repo/}
+                mkdir -p "/tmp/repo-backup/protected-files/$(dirname "$relative_path")"
+                cp -r "$file" "/tmp/repo-backup/protected-files/$relative_path"
+              fi
+            done < <(sort -u /tmp/repo-backup/protected-files.txt)
+          fi
+          
+          echo "保护文件备份完成"
+
+      # 步骤 8: 获取源仓库版本信息
+      - name: Get source repository version
+        id: source_version
+        run: |
+          cd source-repo
+          echo "commit_hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "full_hash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "commit_date=$(git log -1 --format=%cd --date=format:'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "tag=$(git describe --tags --abbrev=0 || echo '无标签')" >> $GITHUB_OUTPUT
+
+      # 步骤 9: 获取目标仓库版本信息
+      - name: Get target repository commit
+        id: target_version
+        run: |
+          cd target-repo
+          echo "TARGET_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "TARGET_BRANCH=${{ env.DEFAULT_BRANCH }}" >> $GITHUB_ENV
+
+      # 步骤 10: 执行同步操作
+      - name: Sync repositories
+        run: |
+          rsync -av --delete \
+            --exclude=.git \
+            --exclude-from=/tmp/repo-backup/protected-files.txt \
+            source-repo/ target-repo/
+          
+          echo "源仓库内容同步完成"
+
+      # 步骤 11: 恢复保护文件
+      - name: Restore protected content
+        run: |
+          if [ -d /tmp/repo-backup/protected-files ]; then
+            cd /tmp/repo-backup/protected-files
+            find . -type f -o -type d | while read item; do
+              if [ -d "$item" ]; then
+                mkdir -p "$GITHUB_WORKSPACE/target-repo/$item"
+              else
+                mkdir -p "$GITHUB_WORKSPACE/target-repo/$(dirname "$item")"
+                cp "$item" "$GITHUB_WORKSPACE/target-repo/$item"
+              fi
+            done
+          fi
+          
+          echo "保护文件恢复完成"
+
+      # 步骤 12: 提交和推送变更
+      - name: Commit and push changes
+        id: commit_push
+        run: |
+          cd target-repo
+          git config user.name "GitHub Actions Sync"
+          git config user.email "actions@github.com"
+          git add -A
+          
+          if git diff-index --quiet HEAD --; then
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+            echo "no_changes_detected=true" >> $GITHUB_OUTPUT
+            echo "没有需要提交的变更"
+          else
+            changes_count=$(git diff --name-only HEAD | wc -l)
+            echo "changes_count=$changes_count" >> $GITHUB_OUTPUT
+            
+            commit_msg="自动同步: 来自 clash-verge-rev/clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}"
+            commit_msg+="\n\n更新 $changes_count 个文件"
+            if [ ${{ steps.find_protected.outputs.protected_files_count }} -gt 0 ]; then
+              commit_msg+=", 保留 ${{ steps.find_protected.outputs.protected_files_count }} 个保护文件"
+            fi
+            
+            if [ "${{ steps.source_version.outputs.tag }}" != "无标签" ]; then
+              commit_msg+="\n\n最新版本: ${{ steps.source_version.outputs.tag }}"
+            fi
+            
+            git commit -m "$commit_msg"
+            git push origin HEAD:${{ env.DEFAULT_BRANCH }}
+            echo "commit_msg=$commit_msg" >> $GITHUB_OUTPUT
+            echo "变更已成功推送"
+          fi
+
+      # 步骤 13: 清理临时文件
+      - name: Cleanup
+        run: |
+          rm -rf source-repo
+          rm -rf /tmp/repo-backup
+
+      # 步骤 14: 设置时区
       - name: Set Shanghai time
         id: set_time
         run: |
@@ -61,7 +208,7 @@ jobs:
           echo "CURRENT_TIME=$CURRENT_TIME" >> $GITHUB_ENV
           echo "CURRENT_TIME_SHORT=$CURRENT_TIME_SHORT" >> $GITHUB_ENV
 
-      # 步骤 16: 调试步骤 - 显示关键信息
+      # 步骤 15: 调试信息
       - name: Debug Information
         run: |
           echo "===== 调试信息 ====="
@@ -75,25 +222,26 @@ jobs:
           echo "保留文件数: ${{ steps.find_protected.outputs.protected_files_count || '0' }}"
           echo "===================="
 
-      # 步骤 17: 最终通知（修复版）
+      # 步骤 16: 最终通知（简化稳定版）
       - name: Final Telegram Notification
-        if: always()  # 即使失败也发送
+        if: always()
         uses: appleboy/telegram-action@v1.0.0
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           parse_mode: markdown
           message: |
-            ${{ (success() && '✅' || '‼️') }} *Clash Verge Rev 同步报告 | ${{ env.CURRENT_TIME_SHORT }}*
+            ${{ success() && '✅' || '‼️' }} *Clash Verge Rev 同步报告 | ${{ env.CURRENT_TIME_SHORT }}*
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            • **状态**: ${{ (success() && '成功' || '失败') }}
+            • **状态**: ${{ success() && '成功' || '失败' }}
             • **工作流**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             • **源仓库**: [clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}](https://github.com/clash-verge-rev/clash-verge-rev/commit/${{ steps.source_version.outputs.full_hash }})
             • **目标仓库**: [13ztop@${{ env.TARGET_COMMIT }}](https://github.com/13ztop/clash-verge-rev/commit/${{ github.sha }})
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            ${{ (steps.commit_push.outputs.changes_count != '0' && steps.commit_push.outputs.changes_count != '') && format('• **变更文件**: {0}', steps.commit_push.outputs.changes_count) || '' }}
+            ${{ steps.commit_push.outputs.changes_count && format('• **变更文件**: {0}', steps.commit_push.outputs.changes_count) || '' }}
             • **保留文件**: ${{ steps.find_protected.outputs.protected_files_count || '0' }}
             • **版本**: ${{ steps.source_version.outputs.tag || '无标签' }}
             • **运行时间**: ${{ env.CURRENT_TIME }}
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            ${{ (success() && '✅ 同步已完成\n[查看提交](' || '🚨 同步过程遇到错误\n[查看日志](') }}${{ github.server_url }}/${{ github.repository }}/${{ (success() && 'commit/' || 'actions/runs/') }}${{ (success() && github.sha || github.run_id) }})
+            ${{ success() && '✅ 同步已完成' || '🚨 同步过程遇到错误' }}
+            [查看详情](${{ github.server_url }}/${{ github.repository }}/${{ success() && 'commit/' || 'actions/runs/' }}${{ success() && github.sha || github.run_id }})
