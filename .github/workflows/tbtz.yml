@@ -2,8 +2,8 @@ name: Auto Sync from clash-verge-rev/clash-verge-rev
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天UTC时间0点（北京时间8点）自动同步
-  workflow_dispatch:      # 允许手动触发
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -222,7 +222,7 @@ jobs:
           echo "保留文件数: ${{ steps.find_protected.outputs.protected_files_count || '0' }}"
           echo "===================="
 
-      # 步骤 16: 最终通知（简化稳定版）
+      # 步骤 16: 最终通知（修复版）
       - name: Final Telegram Notification
         if: always()
         uses: appleboy/telegram-action@v1.0.0
@@ -231,9 +231,9 @@ jobs:
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           parse_mode: markdown
           message: |
-            ${{ success() && '✅' || '‼️' }} *Clash Verge Rev 同步报告 | ${{ env.CURRENT_TIME_SHORT }}*
+            ${{ job.status == 'success' && '✅' || '‼️' }} *Clash Verge Rev 同步报告 | ${{ env.CURRENT_TIME_SHORT }}*
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            • **状态**: ${{ success() && '成功' || '失败' }}
+            • **状态**: ${{ job.status == 'success' && '成功' || '失败' }}
             • **工作流**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             • **源仓库**: [clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}](https://github.com/clash-verge-rev/clash-verge-rev/commit/${{ steps.source_version.outputs.full_hash }})
             • **目标仓库**: [13ztop@${{ env.TARGET_COMMIT }}](https://github.com/13ztop/clash-verge-rev/commit/${{ github.sha }})
@@ -243,5 +243,5 @@ jobs:
             • **版本**: ${{ steps.source_version.outputs.tag || '无标签' }}
             • **运行时间**: ${{ env.CURRENT_TIME }}
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            ${{ success() && '✅ 同步已完成' || '🚨 同步过程遇到错误' }}
-            [查看详情](${{ github.server_url }}/${{ github.repository }}/${{ success() && 'commit/' || 'actions/runs/' }}${{ success() && github.sha || github.run_id }})
+            ${{ job.status == 'success' && '✅ 同步已完成' || '🚨 同步过程遇到错误' }}
+            [查看详情](${{ github.server_url }}/${{ github.repository }}/${{ job.status == 'success' && 'commit/' || 'actions/runs/' }}${{ job.status == 'success' && github.sha || github.run_id }})
