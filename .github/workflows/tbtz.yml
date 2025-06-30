@@ -9,7 +9,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      # [其他步骤保持不变...]
+      # [所有同步步骤保持不变...]
       
       # 设置时区（上海时间）
       - name: Set Shanghai time
@@ -20,62 +20,126 @@ jobs:
           echo "CURRENT_TIME=$CURRENT_TIME" >> $GITHUB_ENV
           echo "CURRENT_TIME_SHORT=$CURRENT_TIME_SHORT" >> $GITHUB_ENV
 
-      # 同步成功通知 (修复版)
-      - name: Notify Telegram on Sync Success
-        if: success() && steps.commit_push.outputs.commit_msg
-        uses: appleboy/telegram-action@master
+      # 调试步骤：验证Telegram设置
+      - name: Verify Telegram Configuration
+        run: |
+          echo "验证Telegram设置..."
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN未设置"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID未设置"
+            exit 1
+          fi
+          
+          echo "Telegram配置验证通过"
+          echo "BOT_TOKEN_PART=${secrets.TELEGRAM_BOT_TOKEN:0:4}...${secrets.TELEGRAM_BOT_TOKEN: -4}" >> $GITHUB_ENV
+          echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
+
+      # 调试步骤：检查通知条件
+      - name: Check Notification Conditions
+        id: check_conditions
+        run: |
+          echo "检查通知条件..."
+          
+          # 检查是否有变更
+          if [ -n "${{ steps.commit_push.outputs.commit_msg }}" ]; then
+            echo "有变更需要通知"
+            echo "should_notify=true" >> $GITHUB_ENV
+            echo "notification_type=success" >> $GITHUB_ENV
+          elif [ "${{ steps.commit_push.outputs.no_changes_detected }}" = "true" ]; then
+            echo "无变更需要通知"
+            echo "should_notify=true" >> $GITHUB_ENV
+            echo "notification_type=no_changes" >> $GITHUB_ENV
+          else
+            echo "无通知条件满足"
+            echo "should_notify=false" >> $GITHUB_ENV
+          fi
+          
+          # 检查失败情况
+          if [ "${{ job.status }}" != "success" ]; then
+            echo "工作流失败需要通知"
+            echo "should_notify=true" >> $GITHUB_ENV
+            echo "notification_type=failure" >> $GITHUB_ENV
+          fi
+          
+          echo "条件检查完成"
+
+      # 测试通知（总是发送）
+      - name: Test Telegram Notification (Always Send)
+        if: ${{ always() }}  # 即使失败也发送
+        uses: appleboy/telegram-action@v1.0.0
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          parse_mode: markdown  # 修复参数名
+          parse_mode: markdown
           message: |
-            🔄 *Clash Verge Rev 同步报告 | ${{ steps.source_version.outputs.commit_date }} (${{ env.CURRENT_TIME_SHORT }})*
+            🔧 *Clash Verge Rev 工作流测试通知*
+            ━━━━━━━━━━━━━━━━━━━━━━━━
+            • **工作流**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            • **运行时间**: ${{ env.CURRENT_TIME }}
+            • **状态**: ${{ job.status }}
+            ━━━━━━━━━━━━━━━━━━━━━━━━
+            ℹ️ 这是一条测试消息，验证通知功能是否正常
+            • BOT_TOKEN: ${{ env.BOT_TOKEN_PART }}
+            • CHAT_ID: ${{ env.CHAT_ID }}
+
+      # 同步成功通知
+      - name: Notify Telegram on Sync Success
+        if: ${{ success() && env.should_notify == 'true' && env.notification_type == 'success' }}
+        uses: appleboy/telegram-action@v1.0.0
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          parse_mode: markdown
+          message: |
+            🔄 *Clash Verge Rev 同步成功 | ${{ steps.source_version.outputs.commit_date }}*
             ━━━━━━━━━━━━━━━━━━━━━━━━
             📦 **源仓库**: [clash-verge-rev/clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}](https://github.com/clash-verge-rev/clash-verge-rev/commit/${{ steps.source_version.outputs.full_hash }})
-            🏠 **目标仓库**: [13ztop/clash-verge-rev@${{ env.TARGET_COMMIT }} (${{ env.TARGET_BRANCH }})](https://github.com/13ztop/clash-verge-rev/tree/${{ env.TARGET_BRANCH }})
+            🏠 **目标仓库**: [13ztop/clash-verge-rev@${{ env.TARGET_COMMIT }}](https://github.com/13ztop/clash-verge-rev/commit/${{ github.sha }})
             ━━━━━━━━━━━━━━━━━━━━━━━━
             • **变更文件**: ${{ steps.commit_push.outputs.changes_count }} 个
             • **保留文件**: ${{ steps.find_protected.outputs.protected_files_count }} 个
-            ${{ format('{0}', steps.source_version.outputs.tag != '无标签' && format('• **最新版本**: {0}', steps.source_version.outputs.tag) || '') }}
+            • **版本**: ${{ steps.source_version.outputs.tag }}
             • **同步时间**: ${{ env.CURRENT_TIME }}
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            ✅ 同步成功！仓库已更新
+            ✅ 仓库已更新
             [查看提交详情](https://github.com/13ztop/clash-verge-rev/commit/${{ github.sha }})
 
-      # 无变更通知 (修复版)
+      # 无变更通知
       - name: Notify Telegram on No Changes
-        if: success() && steps.commit_push.outputs.no_changes_detected
-        uses: appleboy/telegram-action@master
+        if: ${{ success() && env.should_notify == 'true' && env.notification_type == 'no_changes' }}
+        uses: appleboy/telegram-action@v1.0.0
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          parse_mode: markdown  # 修复参数名
+          parse_mode: markdown
           message: |
-            ℹ️ *Clash Verge Rev 同步报告 | ${{ steps.source_version.outputs.commit_date }} (${{ env.CURRENT_TIME_SHORT }})*
+            ℹ️ *Clash Verge Rev 无变更 | ${{ steps.source_version.outputs.commit_date }}*
             ━━━━━━━━━━━━━━━━━━━━━━━━
             📦 **源仓库**: [clash-verge-rev/clash-verge-rev@${{ steps.source_version.outputs.commit_hash }}](https://github.com/clash-verge-rev/clash-verge-rev)
             🏠 **目标仓库**: [13ztop/clash-verge-rev@${{ env.TARGET_COMMIT }}](https://github.com/13ztop/clash-verge-rev)
             ━━━━━━━━━━━━━━━━━━━━━━━━
             • **保留文件**: ${{ steps.find_protected.outputs.protected_files_count }} 个
-            ${{ format('{0}', steps.source_version.outputs.tag != '无标签' && format('• **当前版本**: {0}', steps.source_version.outputs.tag) || '') }}
-            • **同步状态**: 内容一致，无需更新
+            • **当前版本**: ${{ steps.source_version.outputs.tag }}
             • **检测时间**: ${{ env.CURRENT_TIME }}
             ━━━━━━━━━━━━━━━━━━━━━━━━
             ✅ 仓库已是最新状态
-            [查看仓库](https://github.com/13ztop/clash-verge-rev)
 
-      # 同步失败通知 (修复版)
+      # 同步失败通知
       - name: Notify Telegram on Failure
-        if: failure()
-        uses: appleboy/telegram-action@master
+        if: ${{ failure() && env.should_notify == 'true' && env.notification_type == 'failure' }}
+        uses: appleboy/telegram-action@v1.0.0
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          parse_mode: markdown  # 修复参数名
+          parse_mode: markdown
           message: |
-            ‼️ *Clash Verge Rev 同步失败 | ${{ env.CURRENT_TIME_SHORT }}*
+            ‼️ *Clash Verge Rev 同步失败*
             ━━━━━━━━━━━━━━━━━━━━━━━━
-            🔧 **工作流**: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            🔧 **工作流**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             ⏰ **发生时间**: ${{ env.CURRENT_TIME }}
             ━━━━━━━━━━━━━━━━━━━━━━━━
             🚨 同步过程遇到错误，请检查日志！
